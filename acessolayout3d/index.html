@@ -50,7 +50,7 @@ import { initializeApp, deleteApp } from 'https://www.gstatic.com/firebasejs/10.
 import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, sendPasswordResetEmail, signOut,
   updatePassword, reauthenticateWithCredential, EmailAuthProvider, onAuthStateChanged, inMemoryPersistence, setPersistence
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
-import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, collection, getDocs, writeBatch, serverTimestamp
+import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, collection, getDocs, writeBatch, serverTimestamp, Timestamp, deleteField
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
 // cópia do arquivo como ele é, usada para gerar o arquivo novo quando o editor for trocado
@@ -111,12 +111,29 @@ function erroFB(e){
   return (e && e.message) || 'Erro inesperado.';
 }
 
+/* ---------- licença: vence no fim do dia escolhido (horário de Brasília) ---------- */
+const temVence = p => p && p.vence && typeof p.vence.toDate === 'function';
+const vencido = p => temVence(p) && p.vence.toDate().getTime() <= Date.now();
+function dataBR(ts){ return ts.toDate().toLocaleDateString('pt-BR', { timeZone:'America/Sao_Paulo' }); }
+function isoDe(ts){ // 'aaaa-mm-dd' do dia de vencimento, para o campo de data
+  const d = new Date(ts.toDate().getTime() - 1000); // o vencimento é 00:00 do dia seguinte; volta 1s para cair no dia certo
+  return d.toLocaleDateString('en-CA', { timeZone:'America/Sao_Paulo' });
+}
+function venceDe(iso){ // fim do dia 'aaaa-mm-dd' em Brasília = 00:00 do dia seguinte (UTC-3)
+  if (!iso) return null;
+  const [a, m, d] = iso.split('-').map(Number);
+  return Timestamp.fromDate(new Date(Date.UTC(a, m - 1, d + 1, 3, 0, 0)));
+}
+function hojeMais(dias){ const d = new Date(Date.now() + dias * 864e5); return d.toLocaleDateString('en-CA', { timeZone:'America/Sao_Paulo' }); }
+function diasAte(ts){ return Math.ceil((ts.toDate().getTime() - Date.now()) / 864e5); }
+
 /* ---------- abrir o editor depois do login ---------- */
 async function entrarComConta(user){
   const snap = await getDoc(doc(db, 'usuarios', user.uid)).catch(() => null);
   if (!snap || !snap.exists()) throw new Error('Seu e-mail ainda não tem acesso liberado. Fale com o administrador.');
   const p = snap.data();
   if (p.status !== 'ativo') throw new Error('Seu acesso está bloqueado. Fale com o administrador.');
+  if (vencido(p)) throw new Error('Sua licença venceu em ' + dataBR(p.vence) + '. Fale com a IBS para renovar.');
   const ch = await getDoc(doc(db, 'config', 'chave'));
   if (!ch.exists()) throw new Error('O acesso ainda não foi configurado.');
   CK = await ckKey(unb64(ch.data().k));
@@ -351,21 +368,26 @@ async function renderUsuarios(info, err){
   const inN = el('input', { type:'text', maxlength:'80', placeholder:'Nome da pessoa' });
   const inE = el('input', { type:'email', placeholder:'email@empresa.com.br' });
   const inR = el('select', {}, [el('option', { value:'usuario', text:'Usuário' }), el('option', { value:'mestre', text:'Mestre (libera outros)' })]);
-  const add = el('button', { type:'button', class:'lcd-b pri', text:'Liberar acesso', on:{ click: () => liberar(norm(inE.value), inN.value.trim(), inR.value, add) } });
+  const inV = el('input', { type:'date', value: hojeMais(30) });
+  const lbV = el('label', {}, ['Licença válida até (vazio = sem vencimento)', inV]);
+  inR.addEventListener('change', () => { lbV.hidden = inR.value === 'mestre'; });
+  const add = el('button', { type:'button', class:'lcd-b pri', text:'Liberar acesso', on:{ click: () => liberar(norm(inE.value), inN.value.trim(), inR.value, add, inR.value === 'mestre' ? '' : inV.value) } });
   const form = el('div', { class:'lcd-form' }, [
     el('label', {}, ['Nome', inN]), el('label', {}, ['Perfil', inR]),
-    el('label', { class:'full' }, ['E-mail', inE]),
+    el('label', {}, ['E-mail', inE]), lbV,
     el('div', { class:'full' }, [add]),
     el('p', { class:'lcd-note full', text:'A pessoa recebe um e-mail com um link para criar a própria senha. Depois é só abrir o link do layout e entrar.' })
   ]);
 
-  async function liberar(email, nome, role, btn){
+  async function liberar(email, nome, role, btn, vence){
     if (!email || email.indexOf('@') < 1) return renderUsuarios(null, 'Informe um e-mail válido.');
     if (emails.has(email)) return renderUsuarios(null, 'Esse e-mail já está na lista.');
     btn.disabled = true; btn.textContent = 'Criando…';
     try {
       const uid = await criarConta(email);
-      await setDoc(doc(db, 'usuarios', uid), { email, nome, role, status:'ativo', criado:serverTimestamp(), criadoPor:ME.email });
+      const dados = { email, nome, role, status:'ativo', criado:serverTimestamp(), criadoPor:ME.email };
+      if (vence) dados.vence = venceDe(vence);
+      await setDoc(doc(db, 'usuarios', uid), dados);
       await enviarLink(email);
       renderUsuarios('Acesso liberado para ' + email + '. Enviamos o e-mail para a pessoa criar a senha (pode cair no spam).');
     } catch(e){
@@ -380,6 +402,15 @@ async function renderUsuarios(info, err){
     const self = u.uid === ME.uid;
     const acts = el('div', { class:'acts' });
     const btn = (label, cls, fn) => { const b = el('button', { type:'button', class:'lcd-b' + (cls ? ' ' + cls : ''), text:label }); b.addEventListener('click', async () => { b.disabled = true; try { await fn(); } catch(e){ renderUsuarios(null, 'Erro: ' + erroFB(e)); } }); acts.appendChild(b); };
+    if (!self && u.role !== 'mestre'){
+      const inD = el('input', { type:'date', value: temVence(u) ? isoDe(u.vence) : hojeMais(30), style:'background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:3px 6px;font:inherit;font-size:12.5px' });
+      acts.appendChild(inD);
+      btn('Salvar validade', 'pri', async () => {
+        await updateDoc(doc(db, 'usuarios', u.uid), { vence: inD.value ? venceDe(inD.value) : deleteField() });
+        renderUsuarios(inD.value ? 'Licença de ' + u.email + ' válida até ' + inD.value.split('-').reverse().join('/') + '.' : 'Licença de ' + u.email + ' agora sem vencimento.');
+      });
+      acts.appendChild(el('span', { style:'flex-basis:100%;height:0' }));
+    }
     btn('Enviar link de senha', '', async () => { await enviarLink(u.email); renderUsuarios('Link para criar senha enviado para ' + u.email + '.'); });
     if (!self){
       if (u.status === 'ativo') btn('Bloquear', 'del', async () => { await updateDoc(doc(db, 'usuarios', u.uid), { status:'bloqueado' }); renderUsuarios(u.email + ' bloqueado. Ele não entra mais a partir de agora.'); });
@@ -393,8 +424,12 @@ async function renderUsuarios(info, err){
     }
     return el('div', { class:'lcd-u' }, [
       el('div', { class:'h' }, [el('b', { text: u.nome || u.email }),
-        el('span', {}, [u.role === 'mestre' ? el('span', { class:'lcd-st mestre', text:'mestre' }) : null, el('span', { class:'lcd-st ' + u.status, text:u.status })])]),
+        el('span', {}, [u.role === 'mestre' ? el('span', { class:'lcd-st mestre', text:'mestre' }) : null,
+          vencido(u) ? el('span', { class:'lcd-st bloqueado', text:'vencida' }) : el('span', { class:'lcd-st ' + u.status, text:u.status })])]),
       el('div', { class:'m', text: u.email + (self ? ' · você' : '') }),
+      u.role !== 'mestre' ? el('div', { class:'m', text: !temVence(u) ? 'Licença sem vencimento'
+        : vencido(u) ? 'Licença venceu em ' + dataBR(u.vence)
+        : 'Licença válida até ' + dataBR(u.vence) + ' (' + diasAte(u.vence) + (diasAte(u.vence) === 1 ? ' dia)' : ' dias)') }) : null,
       acts
     ]);
   });
@@ -404,7 +439,7 @@ async function renderUsuarios(info, err){
   const blocosAntigos = pend.map(u => {
     const acts = el('div', { class:'acts' });
     const b = el('button', { type:'button', class:'lcd-b pri', text:'Migrar e enviar link' });
-    b.addEventListener('click', () => liberar(norm(u.email), u.nome || '', u.role === 'mestre' ? 'mestre' : 'usuario', b));
+    b.addEventListener('click', () => liberar(norm(u.email), u.nome || '', u.role === 'mestre' ? 'mestre' : 'usuario', b, u.role === 'mestre' ? '' : hojeMais(30)));
     acts.appendChild(b);
     return el('div', { class:'lcd-u' }, [
       el('div', { class:'h' }, [el('b', { text:u.nome || u.email }), el('span', {}, [el('span', { class:'lcd-st antigo', text:'arquivo antigo' })])]),
@@ -419,7 +454,7 @@ async function renderUsuarios(info, err){
     el('div', { style:'display:grid;gap:8px' }, blocos),
     pend.length ? el('h3', { text:'Do arquivo antigo, ainda não migrados' }) : null,
     pend.length ? el('div', { style:'display:grid;gap:8px' }, blocosAntigos) : null
-  ], [el('p', { class:'lcd-note', text:'Tudo aqui vale na hora, para qualquer computador. Não precisa baixar nem subir arquivo para liberar ou bloquear acessos.' })]);
+  ], [el('p', { class:'lcd-note', text:'Tudo aqui vale na hora, para qualquer computador. Não precisa subir arquivo para liberar, bloquear ou renovar. A licença vale até o fim do dia escolhido (horário de Brasília); mestres não vencem.' })]);
 }
 </script>
 </body>
